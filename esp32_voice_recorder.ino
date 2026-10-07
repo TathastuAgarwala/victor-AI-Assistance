@@ -74,3 +74,32 @@ float dcPrevIn = 0.0f;
 float dcPrevOut = 0.0f;
 
 volatile bool micReady = false;
+
+// ============================================================
+// VOICE ACTIVITY DETECTION (end-of-speech detection)
+// ============================================================
+
+// Speech must exceed max(VAD_MIN_THRESHOLD, noiseFloor * VAD_NOISE_RATIO)
+#define VAD_MIN_THRESHOLD     120.0f
+#define VAD_NOISE_RATIO       3.0f
+
+// Consecutive loud blocks needed to start recording (3 x 16 ms)
+#define VAD_START_BLOCKS      3
+
+// Silence after speech before we tell the AI to answer
+#define VAD_SILENCE_MS        1200
+
+// Safety limit for one utterance
+#define VAD_MAX_UTTERANCE_MS  15000
+
+// Audio kept from BEFORE speech was detected (20 x 16 ms = 320 ms)
+#define VAD_PREROLL_BLOCKS    20
+
+// Utterances with fewer loud blocks than this are discarded (clicks, bumps)
+#define VAD_MIN_LOUD_BLOCKS   8
+
+// Calibrate noise floor for this many blocks when listening starts
+#define VAD_CALIB_BLOCKS      40
+
+// Print mic level / threshold once per second (for tuning)
+#define VAD_DEBUG             1
