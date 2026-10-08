@@ -304,3 +304,266 @@ static void fadeOutToSilence()
 
     prevS = 0;
 }
+// ============================================================
+// INITIALIZE TTS STREAM BUFFER
+// ============================================================
+
+bool initAudioBuffer()
+{
+    ttsStream = xStreamBufferCreate(TTS_STREAM_SIZE, 1);
+
+    if (ttsStream == nullptr)
+    {
+        Serial.println("ERROR: TTS stream buffer allocation failed!");
+        Serial.print("Free heap: ");
+        Serial.println(ESP.getFreeHeap());
+        return false;
+    }
+
+    Serial.print("TTS buffer: ");
+    Serial.print(TTS_STREAM_SIZE);
+    Serial.println(" bytes");
+
+    Serial.print("Free heap: ");
+    Serial.println(ESP.getFreeHeap());
+
+    return true;
+}
+
+// ============================================================
+// PLAYBACK USING ESP32 INTERNAL DAC (GPIO25 -> amp)
+// ============================================================
+
+void setupPlaybackI2S()
+{
+    if (dacInstalled)
+    {
+        i2s_driver_uninstall(I2S_DAC_PORT);
+        dacInstalled = false;
+    }
+
+    i2s_config_t config = {};
+
+    config.mode =
+        (i2s_mode_t)(
+            I2S_MODE_MASTER |
+            I2S_MODE_TX |
+            I2S_MODE_DAC_BUILT_IN
+        );
+
+    config.sample_rate = TTS_SAMPLE_RATE * TTS_OVERSAMPLE;
+    config.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+    config.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    config.communication_format = I2S_COMM_FORMAT_STAND_MSB;
+    config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    config.dma_buf_count = 8;
+    config.dma_buf_len = 512;
+    config.use_apll = false;
+    config.tx_desc_auto_clear = true;
+    config.fixed_mclk = 0;
+
+    esp_err_t result = i2s_driver_install(I2S_DAC_PORT, &config, 0, NULL);
+
+    if (result != ESP_OK)
+    {
+        Serial.print("Playback I2S install error: ");
+        Serial.println(result);
+        return;
+    }
+
+    dacInstalled = true;
+
+    i2s_set_pin(I2S_DAC_PORT, NULL);
+    i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);
+
+    // Prime DMA with DAC midpoint (not zero) to avoid a thump
+    writeMidSilence(256 * 16, false);
+
+    Serial.print("TTS DAC playback ready: GPIO25 @ ");
+    Serial.print(TTS_SAMPLE_RATE * TTS_OVERSAMPLE);
+    Serial.println(" Hz");
+}
+
+void stopPlaybackI2S()
+{
+    ttsActive = false;
+
+    // Give the playback task time to leave i2s_write()
+    delay(70);
+
+    // Task is idle now, so it is safe to drop any leftover audio
+    xStreamBufferReset(ttsStream);
+
+    if (dacInstalled)
+    {
+        i2s_driver_uninstall(I2S_DAC_PORT);
+        dacInstalled = false;
+    }
+
+#if IDLE_DAC_HOLD
+    dacWrite(25, 128);
+#endif
+
+    ttsFinished = false;
+
+    // The microphone (I2S1) never stopped. Ignore the speaker's echo tail
+    // for a moment and forget the playback level.
+    ignoreMicUntil = millis() + 500;
+    playLevel = 0.0f;
+
+    Serial.println("Playback finished.");
+}
+
+// ============================================================
+// PLAYBACK TASK
+// ============================================================
+
+void ttsPlaybackTask(void* parameter)
+{
+    alignas(4) static uint8_t raw[TTS_CHUNK_BYTES + 8];
+    static uint16_t out[(TTS_CHUNK_BYTES / 2) * 4 * 2];
+
+    size_t leftover = 0;
+    bool started = false;
+    size_t prebufferNeed = TTS_PREBUFFER_BYTES;
+    int curVol = TTS_VOLUME_PCT;
+
+    const size_t bytesPerFrame = 2 * TTS_INPUT_CHANNELS;
+
+    for (;;)
+    {
+        if (!ttsActive)
+        {
+            started = false;
+            leftover = 0;
+            prebufferNeed = TTS_PREBUFFER_BYTES;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        if (!started)
+        {
+            if (
+                xStreamBufferBytesAvailable(ttsStream) < prebufferNeed &&
+                !ttsFinished
+            )
+            {
+                writeMidSilence(128, true);
+                continue;
+            }
+
+            started = true;
+            leftover = 0;
+            resetDsp();
+
+            curVol = ttsVolumePct;
+            playCalib = PLAY_CALIB_BLOCKS;   // measure playback level in the mic
+
+            Serial.println("Playback started.");
+        }
+
+        size_t got =
+            xStreamBufferReceive(
+                ttsStream,
+                raw + leftover,
+                TTS_CHUNK_BYTES - leftover,
+                pdMS_TO_TICKS(30)
+            );
+
+        if (got == 0)
+        {
+            if (
+                ttsFinished &&
+                xStreamBufferBytesAvailable(ttsStream) == 0
+            )
+            {
+                fadeOutToSilence();
+                writeMidSilence(256 * 8, true);
+
+                started = false;
+                leftover = 0;
+
+                ttsActive = false;
+                ttsStopRequested = true;
+            }
+            else if (!ttsFinished)
+            {
+                fadeOutToSilence();
+
+                started = false;
+                leftover = 0;
+                prebufferNeed = TTS_REBUFFER_BYTES;
+            }
+
+            continue;
+        }
+
+        size_t total = leftover + got;
+        size_t frames = total / bytesPerFrame;
+        size_t used = frames * bytesPerFrame;
+
+        ttsPlayedBytes += used;
+
+        const int16_t* in = (const int16_t*)raw;
+
+        size_t o = 0;
+
+        for (size_t i = 0; i < frames; i++)
+        {
+            int32_t m;
+
+            if (TTS_INPUT_CHANNELS == 2)
+            {
+                m = ((int32_t)in[2 * i] + (int32_t)in[2 * i + 1]) / 2;
+            }
+            else
+            {
+                m = in[i];
+            }
+
+            // Smooth volume changes (ducking) so there are no clicks
+            int target = ttsVolumePct;
+
+            if (curVol < target)
+            {
+                curVol++;
+            }
+            else if (curVol > target)
+            {
+                curVol--;
+            }
+
+            m = (m * curVol) / 100;
+
+            if (m > 32767)  m = 32767;
+            if (m < -32768) m = -32768;
+
+            if (fadeGain < 256)
+            {
+                m = (m * (int32_t)fadeGain) >> 8;
+                fadeGain++;
+            }
+
+            for (int k = 1; k <= TTS_OVERSAMPLE; k++)
+            {
+                int32_t s = prevS + ((m - prevS) * k) / TTS_OVERSAMPLE;
+
+                uint16_t u = quantize(s);
+
+                out[o++] = u;
+                out[o++] = u;
+            }
+
+            prevS = m;
+        }
+
+        leftover = total - used;
+
+        if (leftover > 0)
+        {
+            memmove(raw, raw + used, leftover);
+        }
+
+        writeFrames(out, frames * TTS_OVERSAMPLE, true);
+    }
+}
