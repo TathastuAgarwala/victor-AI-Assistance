@@ -75,7 +75,7 @@ The ESP32 does very little thinking. It records audio, keeps a stable network co
 |:-:|---|---|
 | 1 | **Tathastu Agarwala** | [@TathastuAgarwala](https://github.com/TathastuAgarwala) |
 | 2 | **Arth Parashar** | [@ArthParashar](https://github.com/ArthParashar)|
-| 3 | **Abhisekh Nayak** | – |
+| 3 | **Abhisekh Nayak** |  [@AbhisekhNayak21](https://github.com/AbhisekhNayak21) |
 | 4 | **Akhand Pratap Singh** | – |
 
 </div>
