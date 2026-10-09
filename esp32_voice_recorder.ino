@@ -1077,3 +1077,31 @@ void processMicrophone()
         return;
     }
 
+  // ----------------------------------------------------
+    // RECORDING: stream audio, watch for silence
+    // ----------------------------------------------------
+
+    sendBlock(micPcmBuffer);
+
+    utteranceBlocks++;
+
+    if (level > threshold * 0.7f)
+    {
+        silentBlocks = 0;
+        loudBlocks++;
+    }
+    else
+    {
+        silentBlocks++;
+    }
+
+    if (silentBlocks >= SILENCE_BLOCKS)
+    {
+        endUtterance(false);
+    }
+    else if (utteranceBlocks >= MAX_BLOCKS)
+    {
+        Serial.println("(max length reached)");
+        endUtterance(false);
+    }
+}
