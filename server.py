@@ -16,6 +16,10 @@ import wave
 import xml.etree.ElementTree as ET
 from html import unescape
 
+import shutil
+import subprocess
+
+
 import numpy as np
 import websockets
 from sarvamai import SarvamAI
@@ -42,7 +46,11 @@ except ImportError:
     except ImportError:
         DDGS = None
 
-
+# YOUTUBE / MUSIC
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 # SERVER
 HOST = "0.0.0.0"
@@ -1092,3 +1100,664 @@ async def start_speaking(websocket, state, text):
         if state.get("tts_task") is task:
             state["tts_task"] = None
 
+# FFMPEG
+
+def get_ffmpeg():
+
+    # Prefer the real executable. A scoop "shim" launches ffmpeg as a CHILD
+    # process: killing the shim leaves ffmpeg (and the pipe) alive and
+    # proc.wait() then hangs forever.
+    candidates = [
+        os.path.expanduser(r"~\scoop\apps\ffmpeg\current\bin\ffmpeg.exe"),
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    path = shutil.which("ffmpeg")
+
+    if path:
+        return path
+
+    shim = os.path.expanduser(r"~\scoop\shims\ffmpeg.exe")
+
+    if os.path.exists(shim):
+        return shim
+
+    return None
+
+
+# FIND SONG
+
+def find_song(query):
+
+    if yt_dlp is None:
+        raise RuntimeError("yt-dlp not installed. Run: pip install yt-dlp")
+
+    opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+
+    entries = info.get("entries") or []
+
+    if not entries:
+        raise RuntimeError("No results.")
+
+    entry = entries[0]
+
+    return (
+        entry.get("title", query),
+        entry["url"],
+        entry.get("http_headers") or {},
+    )
+
+
+# MUSIC CHUNKS
+
+async def music_chunks(proc):
+
+    while True:
+        data = await proc.stdout.read(CHUNK_SIZE)
+
+        if not data:
+            break
+
+        yield data
+
+
+# KILL A SUBPROCESS (whole process tree, never hangs)
+
+async def kill_proc(proc):
+
+    if proc is None or proc.returncode is not None:
+        return
+
+    try:
+        if os.name == "nt":
+            # /T kills child processes too (scoop shims, etc.)
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except Exception:
+        pass
+
+
+# PLAY SONG
+
+async def play_song(websocket, state, query):
+
+    proc = None
+
+    try:
+        print()
+        print("================================")
+        print("MUSIC:", query)
+        print("================================")
+
+        try:
+            title, url, headers = await asyncio.to_thread(find_song, query)
+
+        except Exception as e:
+            print("SONG LOOKUP ERROR:", e)
+
+            await start_speaking(
+                websocket, state, "Sorry, I couldn't find that song."
+            )
+            return
+
+        print("Found:", title)
+
+        await send_json(
+            websocket,
+            {"type": "ai_response", "text": f"Playing {title}"},
+        )
+
+        if not await start_speaking(websocket, state, f"Playing {query}."):
+            return
+
+        ffmpeg = get_ffmpeg()
+
+        print("FFmpeg:", ffmpeg)
+
+        if not ffmpeg:
+            print("FFmpeg not found.")
+
+            await start_speaking(
+                websocket,
+                state,
+                "Sorry, I can't play music because FFmpeg was not found.",
+            )
+            return
+
+        header_blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+
+        cmd = [
+            ffmpeg,
+            "-nostdin",
+            "-loglevel", "error",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
+
+        if header_blob:
+            cmd += ["-headers", header_blob]
+
+        cmd += [
+            "-i", url,
+            "-vn",
+            "-t", str(MAX_SONG_SECONDS),
+            "-af", f"volume={MUSIC_VOLUME}",
+            "-f", "s16le",
+            "-ar", str(TTS_SAMPLE_RATE),
+            "-ac", str(TTS_CHANNELS),
+            "pipe:1",
+        ]
+
+        print("Starting FFmpeg...")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+
+        except FileNotFoundError:
+            print("FFmpeg executable not found:", ffmpeg)
+
+            await start_speaking(
+                websocket,
+                state,
+                "Sorry, I can't play music because FFmpeg could not be started.",
+            )
+            return
+
+        print("Music streaming started.")
+
+        await send_audio(websocket, music_chunks(proc), "music")
+
+    except asyncio.CancelledError:
+
+        print("Music playback interrupted.")
+
+        await kill_proc(proc)
+
+        raise
+
+    except Exception as e:
+        print("MUSIC ERROR:", e)
+        traceback.print_exc()
+
+    finally:
+
+        await kill_proc(proc)
+
+        print("Music process closed.")
+
+
+# MUSIC STATUS / STOP
+
+def music_playing(state):
+
+    task = state.get("music_task")
+
+    return task is not None and not task.done()
+
+
+async def stop_music(state):
+
+    task = state.get("music_task")
+
+    if task is None:
+        return False
+
+    if task.done():
+        state["music_task"] = None
+        return False
+
+    print("Stopping music...")
+
+    task.cancel()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), timeout=5
+        )
+    except Exception:
+        print("(music task did not stop in time)")
+
+    state["music_task"] = None
+
+    print("Music stopped.")
+
+    return True
+
+
+async def stop_all_audio(state):
+
+    a = await stop_speaking(state)
+    b = await stop_music(state)
+
+    return bool(a or b)
+
+
+# PROCESS ONE UTTERANCE
+
+async def process_audio(websocket, audio_data, state):
+
+    wav_path = None
+
+    try:
+        duration = len(audio_data) / (
+            INPUT_SAMPLE_RATE * INPUT_SAMPLE_WIDTH * INPUT_CHANNELS
+        )
+
+        print()
+        print("================================")
+        print("PROCESSING SPEECH")
+        print("================================")
+        print("PCM received:", len(audio_data), "bytes", f"({duration:.1f}s)")
+
+        if duration < MIN_UTTERANCE_SECONDS:
+            print("Too short, ignored.")
+            return
+
+        wav_path = save_pcm_as_wav(audio_data)
+
+        # ---------------- STT ----------------
+        transcript = await asyncio.to_thread(speech_to_text, wav_path)
+
+        if not transcript:
+            print("Empty transcript, ignored.")
+            return
+
+        # ---------------- WAKE WORD ----------------
+        now = time.monotonic()
+
+        awake = now < state["awake_until"]
+
+        found, command = extract_wake_word(transcript)
+
+        if found:
+            print("Wake word heard.")
+            print("Command:", command)
+
+        elif awake:
+            command = transcript
+            print("Follow-up (no wake word needed).")
+
+        elif state.get("listening_enabled", False):
+            print("No wake word - ignored.")
+
+            await send_json(
+                websocket, {"type": "ignored", "text": transcript}
+            )
+            return
+
+        else:
+            print("Victor is OFF.")
+            return
+
+        # ---------------- STOP COMMANDS ----------------
+        normalized_command = normalize_phrase(command)
+
+        if (
+            normalized_command in MUSIC_STOP_PHRASES
+            or is_stop_command(normalized_command)
+        ):
+
+            print("STOP COMMAND DETECTED:", normalized_command)
+
+            await stop_all_audio(state)
+
+            await send_json(
+                websocket, {"type": "stopped", "text": transcript}
+            )
+
+            if STOP_ACK:
+                # let the ESP32 finish switching off the old audio
+                await asyncio.sleep(0.3)
+                await start_speaking(websocket, state, STOP_ACK)
+
+            state["awake_until"] = time.monotonic() + FOLLOWUP_SECONDS
+
+            print("Victor is listening again.")
+            return
+
+        # ---------------- END PHRASES ----------------
+        if normalized_command in END_PHRASES:
+            print("End phrase.")
+            state["awake_until"] = 0.0
+            return
+
+        # ---------------- TRANSCRIPT ----------------
+        if not await send_json(
+            websocket, {"type": "transcript", "text": transcript}
+        ):
+            return
+
+        # ---------------- ONLY "VICTOR" ----------------
+        if not command:
+
+            # Music and speech share one channel: never play both at once
+            await stop_music(state)
+
+            await start_speaking(websocket, state, WAKE_ACK)
+
+            state["awake_until"] = time.monotonic() + FOLLOWUP_SECONDS
+
+            return
+
+        # ---------------- PLAY MUSIC ----------------
+        song = parse_play_command(command)
+
+        if song:
+
+            await stop_music(state)
+
+            state["awake_until"] = 0.0
+
+            print("Starting music task...")
+
+            task = asyncio.create_task(play_song(websocket, state, song))
+
+            state["music_task"] = task
+
+            return
+
+        # ---------------- NORMAL AI ----------------
+        await stop_music(state)
+
+        answer = await asyncio.to_thread(ask_ai, command)
+
+        if not answer:
+            await send_json(
+                websocket, {"type": "error", "message": "AI failed."}
+            )
+            return
+
+        await send_json(
+            websocket, {"type": "ai_response", "text": answer}
+        )
+
+        # ---------------- SPEAK ----------------
+        result = await start_speaking(websocket, state, answer)
+
+        if result:
+            state["awake_until"] = time.monotonic() + FOLLOWUP_SECONDS
+
+    except (
+        websockets.exceptions.ConnectionClosed,
+        ConnectionResetError,
+    ) as e:
+        print("ESP32 disconnected:", e)
+
+    except Exception as e:
+        print("PROCESS ERROR:", e)
+        traceback.print_exc()
+
+    finally:
+
+        if wav_path:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+
+
+# BACKGROUND WRAPPER
+
+# Runs process_audio as a separate task so the WebSocket receive
+# loop keeps reading (pings, stop button, etc.) while we search,
+# think and speak. Sends "idle" when done so the ESP32 resumes
+# listening.
+
+async def process_audio_safe(websocket, audio, state):
+
+    state["busy"] = True
+
+    try:
+        await asyncio.wait_for(
+            process_audio(websocket, audio, state), timeout=180
+        )
+
+    except asyncio.TimeoutError:
+        print("PROCESS TIMEOUT - gave up on this request.")
+
+    finally:
+        state["busy"] = False
+        await send_json(websocket, {"type": "idle"})
+
+
+# ESP32 CLIENT
+
+async def handle_client(websocket):
+
+    print()
+    print("================================")
+    print("ESP32 CONNECTED")
+    print("================================")
+
+    audio_buffer = bytearray()
+
+    state = {
+        "awake_until": 0.0,
+        "music_task": None,
+        "tts_task": None,
+        "listening_enabled": True,
+        "websocket": websocket,
+        "busy": False,
+    }
+
+    worker = None
+
+    try:
+
+        async for message in websocket:
+
+            # ---------------- MIC BINARY DATA ----------------
+            if isinstance(message, bytes):
+
+                if state["listening_enabled"] and not state["busy"]:
+                    audio_buffer.extend(message)
+
+                continue
+
+            # ---------------- JSON ----------------
+            try:
+                event = json.loads(message)
+            except json.JSONDecodeError:
+                print("Invalid JSON.")
+                continue
+
+            event_type = event.get("type")
+
+            # ---------------- HELLO ----------------
+            if event_type == "hello":
+                print("ESP32 hello.")
+
+            # ---------------- SWITCH ----------------
+            elif event_type == "session":
+
+                active = bool(event.get("active"))
+
+                print()
+                print("================================")
+                print("SWITCH:", "ON" if active else "OFF")
+                print("================================")
+
+                state["listening_enabled"] = active
+                state["awake_until"] = 0.0
+
+                audio_buffer.clear()
+
+                if not active:
+                    print("Victor OFF.")
+
+                    await stop_all_audio(state)
+
+                    await send_json(
+                        websocket,
+                        {"type": "session_state", "active": False},
+                    )
+
+                else:
+                    print("Victor ON.")
+                    print("Wake word: 'Victor'")
+
+                    await send_json(
+                        websocket,
+                        {"type": "session_state", "active": True},
+                    )
+
+            # ---------------- PHYSICAL STOP BUTTON ----------------
+            elif event_type in ("stop", "stop_music"):
+
+                print("Physical STOP received.")
+
+                await stop_all_audio(state)
+
+                state["awake_until"] = 0.0
+
+                audio_buffer.clear()
+
+                await send_json(websocket, {"type": "stopped"})
+
+            # ---------------- SPEECH START ----------------
+            elif event_type == "speech_start":
+
+                if not state["listening_enabled"] or state["busy"]:
+                    continue
+
+                print()
+                print("================================")
+                print("LISTENING... (speech detected)")
+                print("================================")
+
+                audio_buffer.clear()
+
+                if BARGE_IN_STOPS_MUSIC and music_playing(state):
+                    await stop_music(state)
+
+            # ---------------- SPEECH CANCEL ----------------
+            elif event_type == "speech_cancel":
+
+                print("Speech cancelled.")
+                audio_buffer.clear()
+
+            # ---------------- SPEECH END ----------------
+            elif event_type == "speech_end":
+
+                print()
+                print("SPEECH END")
+
+                if not state["listening_enabled"] or state["busy"]:
+                    audio_buffer.clear()
+                    # tell the ESP32 to resume listening
+                    await send_json(websocket, {"type": "idle"})
+                    continue
+
+                if not audio_buffer:
+                    print("No audio.")
+                    await send_json(websocket, {"type": "idle"})
+                    continue
+
+                audio = bytes(audio_buffer)
+
+                audio_buffer.clear()
+
+                # Do NOT await: keep reading the socket while processing
+                state["busy"] = True
+
+                worker = asyncio.create_task(
+                    process_audio_safe(websocket, audio, state)
+                )
+
+    except websockets.exceptions.ConnectionClosed:
+        print("ESP32 disconnected.")
+
+    except ConnectionResetError:
+        print("ESP32 connection reset.")
+
+    except Exception as e:
+        print("CLIENT ERROR:", e)
+        traceback.print_exc()
+
+    finally:
+
+        if worker is not None and not worker.done():
+            worker.cancel()
+
+        await stop_all_audio(state)
+
+
+# MAIN
+
+async def main():
+
+    print()
+    print("==============================================")
+    print(" ESP32 + SARVAM AI VOICE ASSISTANT (VICTOR)")
+    print("==============================================")
+    print("STT  : Saaras v4")
+    print("LLM  : sarvam-105b-conversations")
+    print("TTS  : Bulbul v3")
+    print(
+        f"AUDIO: {TTS_SAMPLE_RATE} Hz / "
+        f"{'Mono' if TTS_CHANNELS == 1 else 'Stereo'} / 16-bit"
+    )
+    print(f"WS   : {HOST}:{PORT}")
+    print("WAKE : 'Victor'")
+    print("SEARCH:", "ON (ddgs + page scraping)" if DDGS else "OFF (pip install ddgs)")
+    print("MUSIC:", "ON" if yt_dlp else "OFF")
+    print("FFMPEG:", get_ffmpeg() or "NOT FOUND")
+    print()
+    print("Waiting for ESP32...")
+
+    async with websockets.serve(
+        handle_client,
+        HOST,
+        PORT,
+        max_size=None,
+        max_queue=None,        # never stop reading because of queue size
+        ping_interval=None,    # the ESP32 sends its own heartbeat pings
+        ping_timeout=None,
+        write_limit=65536,
+    ):
+        print("Server running.")
+
+        await asyncio.Future()
+
+
+# START
+
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        print("Server stopped.")
