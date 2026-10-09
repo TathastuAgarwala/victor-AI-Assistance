@@ -567,3 +567,513 @@ void ttsPlaybackTask(void* parameter)
         writeFrames(out, frames * TTS_OVERSAMPLE, true);
     }
 }
+
+// ============================================================
+// I2S SETUP (INMP441 MICROPHONE)
+// ============================================================
+
+void setupI2S()
+{
+    i2s_config_t config = {};
+
+    config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    config.sample_rate = 16000;
+    config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+    config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    config.communication_format = I2S_COMM_FORMAT_I2S;
+    config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    config.dma_buf_count = 8;
+    config.dma_buf_len = I2S_BUFFER_SIZE;
+    config.use_apll = false;
+    config.tx_desc_auto_clear = false;
+    config.fixed_mclk = 0;
+
+    i2s_pin_config_t pins = {};
+
+    pins.bck_io_num = I2S_SCK;
+    pins.ws_io_num = I2S_WS;
+    pins.data_out_num = I2S_PIN_NO_CHANGE;
+    pins.data_in_num = I2S_SD;
+
+    esp_err_t result;
+
+    result = i2s_driver_install(I2S_MIC_PORT, &config, 0, NULL);
+
+    if (result != ESP_OK)
+    {
+        Serial.print("I2S driver error: ");
+        Serial.println(result);
+        return;
+    }
+
+    result = i2s_set_pin(I2S_MIC_PORT, &pins);
+
+    if (result != ESP_OK)
+    {
+        Serial.print("I2S pin error: ");
+        Serial.println(result);
+        return;
+    }
+
+    i2s_zero_dma_buffer(I2S_MIC_PORT);
+
+    micReady = true;
+
+    Serial.println("INMP441 ready.");
+}
+
+// ============================================================
+// STATUS LED  (single place that decides the colour)
+//
+//   GREEN = AI speaking / music playing
+//   RED   = recording your voice
+//   short red blink = listening mode ON, waiting for you
+//   OFF   = listening mode OFF
+// ============================================================
+
+void setLed(bool red, bool green)
+{
+    digitalWrite(LED_RED_PIN,   red   ? LED_ON_LEVEL : LED_OFF_LEVEL);
+    digitalWrite(LED_GREEN_PIN, green ? LED_ON_LEVEL : LED_OFF_LEVEL);
+}
+
+void updateLed()
+{
+    bool red = false;
+    bool green = false;
+
+    if (inSpeech)
+    {
+        red = true;
+    }
+    else if (ttsActive)
+    {
+        green = true;
+    }
+    else if (listening && millis() < readyCueUntil)
+    {
+        red = true;     // solid red for 2.5 s after a stop = "I'm listening"
+    }
+#if LISTEN_HEARTBEAT
+    else if (listening && (millis() % 2000) < 150)
+    {
+        red = true;
+    }
+#endif
+
+    setLed(red, green);
+}
+
+// ============================================================
+// VAD / LISTENING HELPERS
+// ============================================================
+
+void resetVad()
+{
+    inSpeech = false;
+    loudStreak = 0;
+    silentBlocks = 0;
+    loudBlocks = 0;
+    utteranceBlocks = 0;
+    prerollHead = 0;
+    prerollCount = 0;
+    calibLeft = VAD_CALIB_BLOCKS;
+    dcPrevIn = 0.0f;
+    dcPrevOut = 0.0f;
+}
+
+void endUtterance(bool cancel)
+{
+    if (!inSpeech)
+    {
+        return;
+    }
+
+    inSpeech = false;
+
+    if (webSocket.isConnected())
+    {
+        if (cancel || loudBlocks < VAD_MIN_LOUD_BLOCKS)
+        {
+            Serial.println("(too short, discarded)");
+            webSocket.sendTXT("{\"type\":\"speech_cancel\"}");
+        }
+        else
+        {
+            Serial.println("STOP RECORDING (silence detected)");
+            webSocket.sendTXT("{\"type\":\"speech_end\"}");
+
+            awaitingReply = true;
+            awaitingReplyUntil = millis() + AWAIT_REPLY_TIMEOUT_MS;
+        }
+    }
+
+    loudStreak = 0;
+    silentBlocks = 0;
+    loudBlocks = 0;
+    utteranceBlocks = 0;
+    prerollHead = 0;
+    prerollCount = 0;
+}
+
+// ------------------------------------------------------------
+// Button pressed WHILE music / TTS is playing:
+// stop the audio, tell the server, and KEEP listening.
+// ------------------------------------------------------------
+
+void stopAudioKeepListening()
+{
+    Serial.println();
+    Serial.println("PHYSICAL STOP: audio stopped, still listening.");
+
+    if (webSocket.isConnected())
+    {
+        // Server kills music/TTS. Session stays active.
+        webSocket.sendTXT("{\"type\":\"stop\"}");
+    }
+
+    listening = true;           // keep listening mode ON
+    awaitingReply = false;
+
+    ttsActive = false;          // playback task stops writing
+    ttsStopRequested = true;    // loop() -> stopPlaybackI2S() -> mic restored
+
+    ignoreButtonUntil = millis() + 1500;   // ignore accidental double-click
+    readyCueUntil     = millis() + 2500;   // solid red = ready, say "Victor"
+}
+
+// ------------------------------------------------------------
+// Button pressed while idle: toggle listening ON / OFF
+// ------------------------------------------------------------
+
+void toggleListening()
+{
+    if (!listening)
+    {
+        if (!webSocket.isConnected())
+        {
+            Serial.println("WebSocket not connected.");
+            return;
+        }
+
+        resetVad();
+        ttsStopRequested = false;
+        ttsFinished = false;
+        listening = true;
+
+        webSocket.sendTXT("{\"type\":\"session\",\"active\":true}");
+
+        Serial.println();
+        Serial.println("==============================");
+        Serial.println("LISTENING MODE ON");
+        Serial.println("Say: \"Victor, ...\"");
+        Serial.println("Press button again to stop.");
+        Serial.println("==============================");
+    }
+    else
+    {
+        endUtterance(true);
+
+        if (webSocket.isConnected())
+        {
+            webSocket.sendTXT("{\"type\":\"stop\"}");
+            webSocket.sendTXT("{\"type\":\"session\",\"active\":false}");
+        }
+
+        listening = false;
+        awaitingReply = false;
+        readyCueUntil = 0;
+        ttsStopRequested = true;
+        ttsFinished = true;
+
+        Serial.println();
+        Serial.println("LISTENING MODE OFF");
+    }
+}
+
+void handleButton()
+{
+    static bool lastRaw = HIGH;
+    static bool stable = HIGH;
+    static unsigned long lastChange = 0;
+
+    bool raw = digitalRead(BUTTON_PIN);
+
+    if (raw != lastRaw)
+    {
+        lastRaw = raw;
+        lastChange = millis();
+    }
+
+    if (millis() - lastChange > 40 && raw != stable)
+    {
+        stable = raw;
+
+        if (stable == LOW)
+        {
+            if (millis() < ignoreButtonUntil)
+            {
+                // Ignore a press right after a stop (double-click protection)
+            }
+            else if (ttsActive)
+            {
+                // Music or TTS is playing: stop it, keep listening
+                stopAudioKeepListening();
+            }
+            else
+            {
+                // Idle: turn listening ON / OFF
+                toggleListening();
+            }
+        }
+    }
+}
+
+// ============================================================
+// MICROPHONE: continuous listening with voice activity detection
+// ============================================================
+
+void sendBlock(const int16_t* block)
+{
+    if (webSocket.isConnected())
+    {
+        webSocket.sendBIN(
+            (const uint8_t*)block,
+            I2S_BUFFER_SIZE * sizeof(int16_t)
+        );
+    }
+}
+
+void processMicrophone()
+{
+    if (!listening || !micReady)
+    {
+        return;
+    }
+
+    // Collect one full block WITHOUT blocking, so webSocket.loop() keeps
+    // running often enough to receive the music stream.
+    static size_t fill = 0;
+
+    size_t got = 0;
+
+    i2s_read(
+        I2S_MIC_PORT,
+        ((uint8_t*)i2sBuffer) + fill,
+        sizeof(i2sBuffer) - fill,
+        &got,
+        0
+    );
+
+    fill += got;
+
+    if (fill < sizeof(i2sBuffer))
+    {
+        return;
+    }
+
+    fill = 0;
+
+    // Server is busy answering: keep the mic drained but send nothing
+    if (awaitingReply)
+    {
+        if (millis() > awaitingReplyUntil)
+        {
+            Serial.println("(reply timeout - listening again)");
+            awaitingReply = false;
+            resetVad();
+        }
+
+        return;
+    }
+
+    // Skip speaker echo right after playback / button stop
+    if (millis() < ignoreMicUntil)
+    {
+        return;
+    }
+
+    bool playing = ttsActive;
+
+    // ----------------------------------------------------
+    // 32-bit I2S -> 16-bit PCM, DC-blocking filter, level
+    // ----------------------------------------------------
+
+    float levelSum = 0.0f;
+
+    for (int i = 0; i < I2S_BUFFER_SIZE; i++)
+    {
+        float x = (float)(i2sBuffer[i] >> MIC_SHIFT);
+
+        float y = x - dcPrevIn + 0.995f * dcPrevOut;
+
+        dcPrevIn = x;
+        dcPrevOut = y;
+
+        if (y > 32767.0f)  y = 32767.0f;
+        if (y < -32768.0f) y = -32768.0f;
+
+        micPcmBuffer[i] = (int16_t)y;
+
+        levelSum += fabsf(y);
+    }
+
+    float level = levelSum / I2S_BUFFER_SIZE;
+
+    // ----------------------------------------------------
+    // Calibration
+    // ----------------------------------------------------
+
+    if (!playing)
+    {
+        playLevel = 0.0f;
+    }
+
+    if (calibLeft > 0)
+    {
+        calibLeft--;
+
+        if (!playing)
+        {
+            noiseFloor = 0.9f * noiseFloor + 0.1f * level;
+        }
+
+        return;
+    }
+
+    if (playing && playCalib > 0)
+    {
+        // Playback just started: learn how loud it is in the mic
+        playCalib--;
+        playLevel = 0.6f * playLevel + 0.4f * level;
+        return;
+    }
+
+    // ----------------------------------------------------
+    // Threshold (higher while music / speech is playing)
+    // ----------------------------------------------------
+
+    float threshold = noiseFloor * VAD_NOISE_RATIO;
+
+    if (threshold < VAD_MIN_THRESHOLD)
+    {
+        threshold = VAD_MIN_THRESHOLD;
+    }
+
+    int startBlocks = VAD_START_BLOCKS;
+
+    if (playing)
+    {
+        float pt = playLevel * PLAY_VAD_RATIO;
+
+        if (pt > threshold)
+        {
+            threshold = pt;
+        }
+
+        startBlocks = PLAY_START_BLOCKS;
+    }
+
+#if VAD_DEBUG
+    static unsigned long lastDebug = 0;
+
+    if (millis() - lastDebug > 1000)
+    {
+        lastDebug = millis();
+
+        Serial.printf(
+            "[mic] level=%.0f floor=%.0f play=%.0f threshold=%.0f %s%s\n",
+            level, noiseFloor, playLevel, threshold,
+            playing ? "(playing) " : "",
+            inSpeech ? "(recording)" : ""
+        );
+    }
+#endif
+
+    // ----------------------------------------------------
+    // NOT RECORDING: keep pre-roll, wait for speech
+    // ----------------------------------------------------
+
+    if (!inSpeech)
+    {
+        if (playing)
+        {
+            // Track the playback level, but never let your voice raise it
+            if (level < threshold)
+            {
+                playLevel += 0.03f * (level - playLevel);
+            }
+            else
+            {
+                playLevel += 0.003f * (level - playLevel);
+            }
+        }
+        else
+        {
+            // Adapt the noise floor to the room
+            if (level < threshold)
+            {
+                noiseFloor += 0.02f * (level - noiseFloor);
+            }
+            else
+            {
+                noiseFloor += 0.001f * (level - noiseFloor);
+            }
+        }
+
+        memcpy(
+            preroll[prerollHead],
+            micPcmBuffer,
+            I2S_BUFFER_SIZE * sizeof(int16_t)
+        );
+
+        prerollHead = (prerollHead + 1) % VAD_PREROLL_BLOCKS;
+
+        if (prerollCount < VAD_PREROLL_BLOCKS)
+        {
+            prerollCount++;
+        }
+
+        if (level > threshold)
+        {
+            loudStreak++;
+        }
+        else
+        {
+            loudStreak = 0;
+        }
+
+        if (loudStreak >= startBlocks && webSocket.isConnected())
+        {
+            Serial.println();
+            Serial.println("==============================");
+            Serial.println(
+                playing
+                    ? "RECORDING... (speech detected over playback)"
+                    : "RECORDING... (speech detected)"
+            );
+            Serial.println("==============================");
+
+            inSpeech = true;
+            silentBlocks = 0;
+            loudBlocks = loudStreak;
+            utteranceBlocks = 0;
+
+            webSocket.sendTXT("{\"type\":\"speech_start\"}");
+
+            // Send the pre-roll (includes the current block)
+            int start = (prerollCount < VAD_PREROLL_BLOCKS) ? 0 : prerollHead;
+
+            for (int k = 0; k < prerollCount; k++)
+            {
+                sendBlock(preroll[(start + k) % VAD_PREROLL_BLOCKS]);
+            }
+
+            prerollHead = 0;
+            prerollCount = 0;
+            loudStreak = 0;
+        }
+
+        return;
+    }
+
