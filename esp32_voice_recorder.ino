@@ -1105,3 +1105,359 @@ void processMicrophone()
         endUtterance(false);
     }
 }
+// ============================================================
+// WEBSOCKET EVENT
+// ============================================================
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length)
+{
+    if (type == WStype_CONNECTED)
+    {
+        Serial.println();
+        Serial.println("WebSocket CONNECTED");
+
+        webSocket.sendTXT("{\"type\":\"hello\",\"device\":\"esp32\"}");
+
+        if (listening)
+        {
+            webSocket.sendTXT("{\"type\":\"session\",\"active\":true}");
+        }
+
+        return;
+    }
+
+    if (type == WStype_DISCONNECTED)
+    {
+        Serial.println();
+        Serial.println("WebSocket DISCONNECTED");
+        Serial.printf("  uptime=%lu ms  heap=%u  min heap=%u  ttsBuf=%u\n",
+                      millis(),
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)ESP.getMinFreeHeap(),
+                      ttsStream ? (unsigned)xStreamBufferBytesAvailable(ttsStream) : 0u);
+
+        inSpeech = false;
+        loudStreak = 0;
+        prerollHead = 0;
+        prerollCount = 0;
+        awaitingReply = false;
+
+        // Connection lost while playing: let the player drain and finish,
+        // otherwise it would wait forever and the mic would stay disabled.
+        if (ttsActive)
+        {
+            ttsFinished = true;
+        }
+
+        return;
+    }
+
+    // ========================================================
+    // BINARY (TTS / MUSIC AUDIO)
+    // ========================================================
+
+    if (type == WStype_BIN)
+    {
+        // Dropped automatically after a physical STOP (ttsActive = false)
+        if (!ttsActive || ttsStream == nullptr)
+        {
+            return;
+        }
+
+        // Short timeout: never block the WebSocket loop for long
+        size_t sent =
+            xStreamBufferSend(
+                ttsStream,
+                payload,
+                length,
+                pdMS_TO_TICKS(150)
+            );
+
+        ttsRxBytes += sent;
+
+        if (sent != length)
+        {
+            Serial.printf(
+                "TTS BUFFER FULL: %u/%u\n",
+                (unsigned)sent,
+                (unsigned)length
+            );
+        }
+
+        return;
+    }
+
+    // ========================================================
+    // TEXT
+    // ========================================================
+
+    if (type == WStype_TEXT)
+    {
+        JsonDocument doc;
+
+        DeserializationError error = deserializeJson(doc, payload, length);
+
+        if (error)
+        {
+            Serial.print("JSON error: ");
+            Serial.println(error.c_str());
+            return;
+        }
+
+        const char* event = doc["type"];
+
+        if (!event)
+        {
+            return;
+        }
+
+        if (strcmp(event, "transcript") == 0)
+        {
+            const char* text = doc["text"];
+
+            Serial.println();
+            Serial.println("YOU:");
+            Serial.println(text ? text : "");
+        }
+        else if (strcmp(event, "ai_response") == 0)
+        {
+            const char* text = doc["text"];
+
+            Serial.println();
+            Serial.println("AI:");
+            Serial.println(text ? text : "");
+        }
+        else if (strcmp(event, "idle") == 0)
+        {
+            // Server finished processing this utterance
+            awaitingReply = false;
+        }
+        else if (strcmp(event, "ignored") == 0)
+        {
+            awaitingReply = false;
+
+            const char* text = doc["text"];
+
+            Serial.print("(ignored - no wake word) ");
+            Serial.println(text ? text : "");
+        }
+        else if (strcmp(event, "tts_start") == 0)
+        {
+            Serial.println();
+            Serial.println("TTS / MUSIC START");
+
+            // The microphone has its own I2S port, so a recording in progress
+            // is NOT interrupted by playback.
+
+            if (ttsActive)
+            {
+                ttsActive = false;
+                delay(120);
+            }
+
+            ttsStopRequested = false;
+            ttsFinished = false;
+            awaitingReply = false;
+            ttsRxBytes = 0;
+            ttsPlayedBytes = 0;
+
+            xStreamBufferReset(ttsStream);
+
+            setupPlaybackI2S();
+
+            ttsActive = true;
+        }
+        else if (
+            strcmp(event, "tts_stop") == 0 ||
+            strcmp(event, "stopped") == 0
+        )
+        {
+            // Server cancelled speech/music (voice "stop", new command...).
+            // Stop right away and bring the microphone back.
+            awaitingReply = false;
+
+            if (ttsActive)
+            {
+                Serial.println("Server stopped the audio.");
+
+                ttsActive = false;
+                ttsStopRequested = true;
+            }
+        }
+        else if (strcmp(event, "tts_end") == 0)
+        {
+            Serial.println("TTS NETWORK END");
+
+            // Ignore a late tts_end that arrives after a physical STOP
+            if (ttsActive)
+            {
+                ttsFinished = true;
+            }
+        }
+        else if (strcmp(event, "error") == 0)
+        {
+            const char* message = doc["message"];
+
+            awaitingReply = false;
+
+            Serial.print("SERVER ERROR: ");
+            Serial.println(message ? message : "");
+        }
+    }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("ESP32 VOICE ASSISTANT - VICTOR");
+    Serial.println("================================");
+
+    initSilence();
+
+    if (!initAudioBuffer())
+    {
+        Serial.println("FATAL: Cannot allocate audio buffer.");
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
+    xTaskCreatePinnedToCore(
+        ttsPlaybackTask,
+        "ttsPlay",
+        6144,
+        NULL,
+        3,
+        NULL,
+        1
+    );
+
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    pinMode(LED_RED_PIN, OUTPUT);
+    pinMode(LED_GREEN_PIN, OUTPUT);
+
+    // LED self-test: red, then green, then off
+    setLed(true, false);  delay(500);
+    setLed(false, true);  delay(500);
+    setLed(false, false);
+
+    setupI2S();
+
+#if IDLE_DAC_HOLD
+    dacWrite(25, 128);
+#endif
+
+    Serial.println();
+    Serial.println("Connecting WiFi...");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("WiFi connected.");
+
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("Server: ");
+    Serial.print(SERVER_IP);
+    Serial.print(":");
+    Serial.println(SERVER_PORT);
+
+    webSocket.begin(SERVER_IP, SERVER_PORT, SERVER_PATH);
+    webSocket.onEvent(webSocketEvent);
+    webSocket.setReconnectInterval(3000);
+    webSocket.enableHeartbeat(25000, 10000, 5);   // tolerant while streaming audio
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("SYSTEM READY");
+    Serial.println("================================");
+    Serial.println();
+    Serial.println("Button (idle): listening ON / OFF.");
+    Serial.println("Button (while audio plays): stop audio, keep listening.");
+    Serial.println("Then say: \"Victor, ...\"");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    webSocket.loop();
+
+    handleButton();
+
+    processMicrophone();
+
+    // Playback finished or stopped -> restore microphone
+    if (ttsStopRequested)
+    {
+        ttsStopRequested = false;
+        stopPlaybackI2S();
+    }
+
+    // Lower the playback volume while you are speaking
+    ttsVolumePct = (ttsActive && inSpeech) ? TTS_DUCK_PCT : TTS_VOLUME_PCT;
+
+    updateLed();
+
+    // Playback statistics: PLAYED should grow ~44100 bytes/s
+    static unsigned long lastStats = 0;
+
+    if (ttsActive && millis() - lastStats > 2000)
+    {
+        lastStats = millis();
+
+        Serial.printf(
+            "[play] rx=%u played=%u buffered=%u heap=%u\n",
+            (unsigned)ttsRxBytes,
+            (unsigned)ttsPlayedBytes,
+            (unsigned)xStreamBufferBytesAvailable(ttsStream),
+            (unsigned)ESP.getFreeHeap()
+        );
+    }
+
+    // Memory monitor
+    static unsigned long lastMemoryPrint = 0;
+
+    if (millis() - lastMemoryPrint > 10000)
+    {
+        lastMemoryPrint = millis();
+
+        Serial.print("Free heap: ");
+        Serial.print(ESP.getFreeHeap());
+
+        Serial.print(" | TTS buffer: ");
+        Serial.println(
+            ttsStream
+                ? (unsigned)xStreamBufferBytesAvailable(ttsStream)
+                : 0u
+        );
+    }
+
+    // i2s_read paces the loop only while the mic is actually being read.
+    // During playback (or when not listening) yield so WiFi/WebSocket
+    // get time and the loop does not spin at 100% CPU.
+    delay(1);
+}
